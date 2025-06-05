@@ -45,6 +45,10 @@
 #include <sys/select.h>
 #include "rtl-sdr.h"
 #include "anet.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#define CERT_FILE "cert.pem"
+#define KEY_FILE "key.pem"
 
 #define MODES_DEFAULT_RATE         2000000
 #define MODES_DEFAULT_FREQ         1090000000
@@ -85,7 +89,8 @@
 
 #define MODES_NET_MAX_FD 1024
 #define MODES_NET_OUTPUT_SBS_PORT 30003
-#define MODES_NET_OUTPUT_RAW_PORT 30002
+#define MODES_NET_OUTPUT_RAW_PORT 30005
+#define MODES_NET_OUTPUT_SRAW_PORT 30002
 #define MODES_NET_INPUT_RAW_PORT 30001
 #define MODES_NET_HTTP_PORT 8080
 #define MODES_CLIENT_BUF_SIZE 1024
@@ -93,12 +98,14 @@
 
 #define MODES_NOTUSED(V) ((void) V)
 
+SSL_CTX* ctx = NULL; /* SSL context for secure connections. */
 /* Structure used to describe a networking client. */
 struct client {
     int fd;         /* File descriptor. */
     int service;    /* TCP port the client is connected to. */
     char buf[MODES_CLIENT_BUF_SIZE+1];    /* Read buffer. */
     int buflen;                         /* Amount of data on buffer. */
+    SSL *ssl;    /* SSL connection if any. */
 };
 
 /* Structure used to describe an aircraft in iteractive mode. */
@@ -152,6 +159,7 @@ struct {
     int ros;                        /* Raw output listening socket. */
     int ris;                        /* Raw input listening socket. */
     int https;                      /* HTTP listening socket. */
+    int eros;                       /* Encrypted Raw output listening socket. */
 
     /* Configuration */
     char *filename;                 /* Input form file, --ifile option. */
@@ -242,6 +250,12 @@ int fixTwoBitsErrors(unsigned char *msg, int bits);
 int modesMessageLenByType(int type);
 void sigWinchCallback();
 int getTermRows();
+
+/*secure communication*/
+void init_openssl(void);
+void cleanup_openssl(void);
+SSL_CTX* create_context(void);
+void configure_context(SSL_CTX* ctx);
 
 /* ============================= Utility functions ========================== */
 
@@ -1916,7 +1930,9 @@ void snipMode(int level) {
 #define MODES_NET_SERVICE_RAWI 1
 #define MODES_NET_SERVICE_HTTP 2
 #define MODES_NET_SERVICE_SBS 3
-#define MODES_NET_SERVICES_NUM 4
+#define MODES_NET_SERVICE_SRAW 4
+#define MODES_NET_SERVICES_NUM 5
+
 struct {
     char *descr;
     int *socket;
@@ -1925,12 +1941,17 @@ struct {
     {"Raw TCP output", &Modes.ros, MODES_NET_OUTPUT_RAW_PORT},
     {"Raw TCP input", &Modes.ris, MODES_NET_INPUT_RAW_PORT},
     {"HTTP server", &Modes.https, MODES_NET_HTTP_PORT},
-    {"Basestation TCP output", &Modes.sbsos, MODES_NET_OUTPUT_SBS_PORT}
+    {"Basestation TCP output", &Modes.sbsos, MODES_NET_OUTPUT_SBS_PORT},
+    {"Secure Raw TCP output", &Modes.eros, MODES_NET_OUTPUT_SRAW_PORT}
 };
 
 /* Networking "stack" initialization. */
 void modesInitNet(void) {
     int j;
+
+    init_openssl();
+    ctx = create_context();
+    configure_context(ctx);
 
     memset(Modes.clients,0,sizeof(Modes.clients));
     Modes.maxfd = -1;
@@ -1960,26 +1981,57 @@ void modesAcceptClients(void) {
     struct client *c;
 
     for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
-        fd = anetTcpAccept(Modes.aneterr, *modesNetServices[j].socket,
+        if(modesNetServices[j].port == MODES_NET_OUTPUT_SRAW_PORT)
+        {
+            SSL* ssl = NULL;
+
+            fd = anetTcpSecureAccept(Modes.aneterr, *modesNetServices[j].socket,
+                           NULL, &port, &ssl, ctx);
+
+            if (fd == -1) {
+                if (Modes.debug & MODES_DEBUG_NET && errno != EAGAIN)
+                    printf("Accept %d: %s\n", *modesNetServices[j].socket,
+                        strerror(errno));
+                continue;
+            }
+
+            if (fd >= MODES_NET_MAX_FD) {
+                close(fd);
+                return; /* Max number of clients reached. */
+            }
+            anetNonBlock(Modes.aneterr, fd);
+            c = malloc(sizeof(*c));
+            c->service = *modesNetServices[j].socket;
+            c->fd = fd;
+            c->buflen = 0;
+            c->ssl = ssl;  /* SSL connection established. */
+            Modes.clients[fd] = c;
+        }
+        else
+        {
+            fd = anetTcpAccept(Modes.aneterr, *modesNetServices[j].socket,
                            NULL, &port);
-        if (fd == -1) {
-            if (Modes.debug & MODES_DEBUG_NET && errno != EAGAIN)
-                printf("Accept %d: %s\n", *modesNetServices[j].socket,
-                       strerror(errno));
-            continue;
+            if (fd == -1) {
+                if (Modes.debug & MODES_DEBUG_NET && errno != EAGAIN)
+                    printf("Accept %d: %s\n", *modesNetServices[j].socket,
+                        strerror(errno));
+                continue;
+            }
+
+            if (fd >= MODES_NET_MAX_FD) {
+                close(fd);
+                return; /* Max number of clients reached. */
+            }
+            anetNonBlock(Modes.aneterr, fd);
+
+            c = malloc(sizeof(*c));
+            c->service = *modesNetServices[j].socket;
+            c->fd = fd;
+            c->buflen = 0;
+            c->ssl = NULL;  /* No SSL connection yet. */
+            Modes.clients[fd] = c;
         }
 
-        if (fd >= MODES_NET_MAX_FD) {
-            close(fd);
-            return; /* Max number of clients reached. */
-        }
-
-        anetNonBlock(Modes.aneterr, fd);
-        c = malloc(sizeof(*c));
-        c->service = *modesNetServices[j].socket;
-        c->fd = fd;
-        c->buflen = 0;
-        Modes.clients[fd] = c;
         anetSetSendBuffer(Modes.aneterr,fd,MODES_NET_SNDBUF_SIZE);
 
         if (Modes.maxfd < fd) Modes.maxfd = fd;
@@ -1995,6 +2047,16 @@ void modesAcceptClients(void) {
 
 /* On error free the client, collect the structure, adjust maxfd if needed. */
 void modesFreeClient(int fd) {
+    if (Modes.clients[fd] == NULL) return; /* Already freed. */
+    /* If the client has an SSL connection, shutdown and free it. */
+    /* Note that we don't check if the SSL connection is established, as
+     * we are sure that if it exists, it was established. */
+    if (Modes.clients[fd] && Modes.clients[fd]->ssl)
+    {
+        SSL_shutdown(Modes.clients[fd]->ssl);
+        SSL_free(Modes.clients[fd]->ssl);
+    }
+
     close(fd);
     free(Modes.clients[fd]);
     Modes.clients[fd] = NULL;
@@ -2025,8 +2087,24 @@ void modesSendAllClients(int service, void *msg, int len) {
 
     for (j = 0; j <= Modes.maxfd; j++) {
         c = Modes.clients[j];
-        if (c && c->service == service) {
+        if (c && c->service == service && c->service != Modes.eros) {
             int nwritten = write(j, msg, len);
+            if (nwritten != len) {
+                modesFreeClient(j);
+            }
+        }
+    }
+}
+
+/* Send the specified message to all clients listening for a given service. */
+void modesSendAllSecureClients(int service, void *msg, int len) {
+    int j;
+    struct client *c;
+
+    for (j = 0; j <= Modes.maxfd; j++) {
+        c = Modes.clients[j];
+        if (c && c->service == service && c->ssl != NULL) {
+            int nwritten = SSL_write(c->ssl, msg, len);
             if (nwritten != len) {
                 modesFreeClient(j);
             }
@@ -2047,8 +2125,9 @@ void modesSendRawOutput(struct modesMessage *mm) {
     *p++ = ';';
     *p++ = '\n';
     modesSendAllClients(Modes.ros, msg, p-msg);
+    /* Also send to the raw secure input clients. */
+    modesSendAllSecureClients(Modes.eros, msg, p-msg);
 }
-
 
 /* Write SBS output to TCP clients. */
 void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a) {
@@ -2501,6 +2580,48 @@ void backgroundTasks(void) {
     }
 }
 
+void init_openssl() {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+void cleanup_openssl() {
+    EVP_cleanup();
+}
+
+SSL_CTX* create_context() {
+    const SSL_METHOD* method = TLS_server_method();
+    SSL_CTX* ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)) {
+        fprintf(stderr, "Failed to set min TLS version\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (!SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION)) {
+        fprintf(stderr, "Failed to set max TLS version\n");
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+void configure_context(SSL_CTX* ctx) {
+    // Set the certificate and private key
+    if (SSL_CTX_use_certificate_file(ctx, CERT_FILE, SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, KEY_FILE, SSL_FILETYPE_PEM) <= 0 ) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
 int main(int argc, char **argv) {
     int j;
 
@@ -2657,7 +2778,8 @@ int main(int argc, char **argv) {
         printf("%lld total usable messages\n",
             Modes.stat_goodcrc + Modes.stat_fixed);
     }
-
+    SSL_CTX_free(ctx);
+    cleanup_openssl();
     rtlsdr_close(Modes.dev);
     return 0;
 }

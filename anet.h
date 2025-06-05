@@ -39,6 +39,9 @@
 #define AF_LOCAL AF_UNIX
 #endif
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 int anetTcpConnect(char *err, char *addr, int port);
 int anetTcpNonBlockConnect(char *err, char *addr, int port);
 int anetUnixConnect(char *err, char *path);
@@ -48,6 +51,7 @@ int anetResolve(char *err, char *host, char *ipbuf);
 int anetTcpServer(char *err, int port, char *bindaddr);
 int anetUnixServer(char *err, char *path, mode_t perm);
 int anetTcpAccept(char *err, int serversock, char *ip, int *port);
+int anetTcpSecureAccept(char *err, int serversock, char *ip, int *port, SSL **ssl, SSL_CTX *ctx);
 int anetUnixAccept(char *err, int serversock);
 int anetWrite(int fd, char *buf, int count);
 int anetNonBlock(char *err, int fd);

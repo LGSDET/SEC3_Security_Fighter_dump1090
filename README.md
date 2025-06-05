@@ -268,6 +268,12 @@ Use it like this:
 I used it in order to create a small test file to include inside this
 program source code distribution.
 
+Generate certificate and key
+---
+
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=your.server.com"
+Create in home directory of dump1090
+
 Contributing
 ---
 

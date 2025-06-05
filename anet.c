@@ -329,11 +329,50 @@ static int anetGenericAccept(char *err, int s, struct sockaddr *sa, socklen_t *l
     return fd;
 }
 
+static int anetSecureAccept(char *err, int s, struct sockaddr *sa, socklen_t *len, SSL **ssl, SSL_CTX *ctx) {
+    int fd;
+    while(1) {
+        fd = accept(s,sa,len);
+        if (fd == -1) {
+            if (errno == EINTR)
+                continue;
+            else {
+                anetSetError(err, "accept: %s", strerror(errno));
+                return ANET_ERR;
+            }
+        }
+        *ssl = SSL_new(ctx);
+        SSL_set_fd(*ssl, fd);
+        if (SSL_accept(*ssl) <= 0) {
+            anetSetError(err, "SSL accept: %s", ERR_error_string(ERR_get_error(), NULL));
+            SSL_shutdown(*ssl);
+            SSL_free(*ssl);
+            close(fd);
+            continue;
+        }
+	    printf("Connection established with TLS version: %s\n", SSL_get_version(*ssl));
+        break;
+    }
+    return fd;
+}
+
 int anetTcpAccept(char *err, int s, char *ip, int *port) {
     int fd;
     struct sockaddr_in sa;
     socklen_t salen = sizeof(sa);
     if ((fd = anetGenericAccept(err,s,(struct sockaddr*)&sa,&salen)) == ANET_ERR)
+        return ANET_ERR;
+
+    if (ip) strcpy(ip,inet_ntoa(sa.sin_addr));
+    if (port) *port = ntohs(sa.sin_port);
+    return fd;
+}
+
+int anetTcpSecureAccept(char *err, int s, char *ip, int *port, SSL **ssl, SSL_CTX *ctx) {
+    int fd;
+    struct sockaddr_in sa;
+    socklen_t salen = sizeof(sa);
+    if ((fd = anetSecureAccept(err,s,(struct sockaddr*)&sa,&salen,ssl,ctx)) == ANET_ERR)
         return ANET_ERR;
 
     if (ip) strcpy(ip,inet_ntoa(sa.sin_addr));
